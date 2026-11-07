@@ -1,0 +1,147 @@
+name: build-iso
+
+# Builds the RMMP ISO and publishes it in THIS repository.
+#
+# The distribution source lives in the private repository
+# stainleSSStar/RMMP; this workflow checks it out with a personal access token
+# (secret RMMP_SOURCE_TOKEN, needs the `repo` scope) because a workflow can
+# only read repositories it has credentials for.
+#
+# Why the build runs here and not in RMMP: GitHub Actions artifacts are size
+# limited (~500 MB), so multi-gigabyte ISO parts belong in a public repository
+# where they can also be downloaded without authentication. Release assets are
+# the distribution channel; the per-part artifacts are a convenience copy.
+#
+# Triggers:
+#   workflow_dispatch    build now, optionally with an explicit release tag
+#   schedule             weekly build, published as a prerelease
+#   repository_dispatch  sent by RMMP's trigger-build.yml on push/tag
+#
+# Required secrets:
+#   RMMP_SOURCE_TOKEN   PAT with `repo` scope, able to read stainleSSStar/RMMP
+#                       (and to push releases here if the default GITHUB_TOKEN
+#                       is not sufficient - it normally is)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (empty = today's date, e.g. 2026.11.07)"
+        required: false
+        default: ""
+      prerelease:
+        description: "Publish as a prerelease"
+        type: boolean
+        default: false
+  schedule:
+    # Sunday 03:11 UTC
+    - cron: "11 3 * * 0"
+  repository_dispatch:
+    types: [build-iso]
+
+permissions:
+  contents: write   # needed to create the release in this repository
+
+jobs:
+  build:
+    name: build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the RMMP source
+        uses: actions/checkout@v4
+        with:
+          repository: stainleSSStar/RMMP
+          token: ${{ secrets.RMMP_SOURCE_TOKEN }}
+          path: source
+
+      - name: Resolve the release tag
+        id: meta
+        run: |
+          # workflow_dispatch input, repository_dispatch payload, or today.
+          tag="${{ inputs.tag }}"
+          [[ -n "$tag" ]] || tag="${{ github.event.client_payload.tag }}"
+          if [[ -z "$tag" || "$tag" == "main" || "$tag" == "master" ]]; then
+            sha="${{ github.event.client_payload.sha }}"
+            if [[ -n "$sha" ]]; then
+              tag="$(date -u +%Y.%m.%d)-${sha:0:7}"
+            else
+              tag="$(date -u +%Y.%m.%d)"
+            fi
+          fi
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "release name: $tag"
+
+      - name: Free runner disk space
+        run: |
+          # The runner image carries several GB of unused SDKs; the build needs
+          # roughly 15 GB of scratch space.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/share/swift
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Build the ISO in an Arch container
+        run: |
+          docker run --rm --privileged --cap-add=all \
+            -v "$PWD/source:/work" -w /work -e BUILD_LOCAL_REPO=yes \
+            archlinux:latest /work/scripts/container-build.sh
+
+      - name: Make the build output accessible to the runner
+        # The container builds as uid 1000; the runner user is uid 1001.
+        run: sudo chown -R "$(id -u):$(id -g)" source/build
+
+      - name: Drop the mkarchiso scratch tree
+        run: |
+          du -sh source/build/work 2>/dev/null || true
+          sudo rm -rf source/build/work
+          df -h /
+
+      - name: Split the ISO for upload
+        run: |
+          cd source/build/out
+          iso=$(ls -1 *.iso | head -1)
+          echo "ISO: $iso ($(du -h "$iso" | cut -f1))"
+          sha256sum "$iso" > SHA256SUMS
+          cat SHA256SUMS
+          # One artifact per part keeps every upload below the platform limit,
+          # whatever the final ISO size is; `cat` reassembles them.
+          split -b 450M -d -a 2 "$iso" "${iso}.part"
+          ls -lh
+
+      - name: Upload ISO parts as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rmmp-iso
+          path: |
+            source/build/out/*.part*
+            source/build/out/SHA256SUMS
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Publish the release
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          cd source/build/out
+          notes=$(mktemp)
+          {
+            echo "RMMP ${TAG} - Arch Linux, Trinity Desktop, XLibre."
+            echo
+            echo "Reassemble the ISO with:"
+            echo
+            echo "    cat rmmp-*.part* > rmmp.iso"
+            echo "    sha256sum -c SHA256SUMS"
+            echo
+            echo "Write it to a USB stick with:"
+            echo
+            echo "    sudo dd if=rmmp.iso of=/dev/sdX bs=4M status=progress oflag=sync"
+            echo
+            echo "Source and documentation: https://github.com/stainleSSStar/RMMP"
+          } >"$notes"
+          args=(create "${TAG}" --title "RMMP ${TAG}" --notes-file "$notes" --clobber)
+          # Weekly builds are prereleases unless explicitly overridden.
+          if [[ "${PRERELEASE}" == "true" || "${{ github.event_name }}" == "schedule" ]]; then
+            args+=(--prerelease)
+          fi
+          gh release "${args[@]}" *.part* SHA256SUMS
